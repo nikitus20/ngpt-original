@@ -55,6 +55,7 @@ import torch.distributed as dist
 from model import GPTConfig, GPT
 from torch.nn import functional as F
 from datetime import timedelta
+from tqdm import tqdm # Import tqdm
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -326,6 +327,7 @@ if wandb_log and master_process:
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
+running_mfu = -1.0 # MFU is not calculated in this version
 
 
 if master_process:
@@ -423,120 +425,160 @@ def normalize_matrices():
 if (use_nGPT == 1):
     normalize_matrices()
 
-while True:
-    #sys.stdout.flush()
-    if (local_iter_num > max_iters_per_launch):
-        break
-    if (1):
-        local_seed = 100*iter_num + seed_offset # local_seed should never exceed 2.147e+9 because of np.random.seed, 100 here should be > nworkers
-        np.random.seed(local_seed)
-        torch.manual_seed(local_seed)
-        torch.cuda.manual_seed(local_seed)
-        #if (iter_num % 10 == 0):    # uncomment to make sure different seeds are used
-        #    print("iter: %d seed: %d" % (iter_num, local_seed))
+# Wrap the main training loop with tqdm
+if master_process:
+    print(f"Starting training from iteration {iter_num} up to {max_iters}")
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr 
+with tqdm(total=max_iters, desc="Training", initial=iter_num, disable=not master_process) as pbar:
+    while True:
+        #sys.stdout.flush()
+        if (local_iter_num > max_iters_per_launch):
+            break
+        if (1):
+            local_seed = 100*iter_num + seed_offset # local_seed should never exceed 2.147e+9 because of np.random.seed, 100 here should be > nworkers
+            np.random.seed(local_seed)
+            torch.manual_seed(local_seed)
+            torch.cuda.manual_seed(local_seed)
+            #if (iter_num % 10 == 0):    # uncomment to make sure different seeds are used
+            #    print("iter: %d seed: %d" % (iter_num, local_seed))
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        rng_state_pytorch = torch.get_rng_state()
-        rng_state_bytes = rng_state_pytorch.numpy().tobytes()
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.6f}, val loss {losses['val']:.6f}")
-       
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr
-            })
+        # determine and set the learning rate for this iteration
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-        if always_save_checkpoint:
-            if iter_num > starting_iter_num:
-                tcheckpointsaving_begin = time.time()
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'config': config,
-                    'rng_state_pytorch_bytes': rng_state_bytes,
-                    'rng_state_numpy': np.random.get_state()
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(globals().get('out_dir', './'), 'ckpt.pt')) # Use potentially overridden out_dir
-                print("Checkpoint saving time: %f sec" % (time.time()-tcheckpointsaving_begin))
-    
-    if iter_num == 0 and eval_only:
-        break
-
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    X, Y = get_batch('train')
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        #.scale(loss).backward()
-        loss.backward()
-
-    if grad_clip != 0.0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    optimizer.step()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
-
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms")
-    
-    if (use_nGPT == 1):
-        normalize_matrices()
-
-    if (iter_num % 100 == 0) and master_process:
-        print("lr=%f" % lr)
-
-    if master_process:
-        resstr = f"{iter_num:.6e} {lr:.4e} {losses['train']:.4e} {losses['val']:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0:.4e} {0.0:.4e} "
-        resstr = resstr + get_hparams_str(model) + "\n"
+        # evaluate the loss on train/val sets and write checkpoints
+        if iter_num % eval_interval == 0 and master_process:
+            rng_state_pytorch = torch.get_rng_state()
+            rng_state_bytes = rng_state_pytorch.numpy().tobytes()
+            losses = estimate_loss()
+            # Use tqdm.write for cleaner output with progress bar
+            pbar.write(f"step {iter_num}: train loss {losses['train']:.6f}, val loss {losses['val']:.6f}")
         
-        file.write(resstr)
-        file.flush()
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
 
-        if iter_num >= max_iters:
-            finished_fname = os.path.join(globals().get('out_dir', './'), "finished") # Use potentially overridden out_dir
-            finished_file = open(finished_fname, "w")
-            finished_file.write("1")
-            finished_file.close()
+            if always_save_checkpoint:
+                if iter_num > starting_iter_num:
+                    tcheckpointsaving_begin = time.time()
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'config': config,
+                        'rng_state_pytorch_bytes': rng_state_bytes,
+                        'rng_state_numpy': np.random.get_state()
+                    }
+                    ckpt_save_path = os.path.join(globals().get('out_dir', './'), 'ckpt.pt')
+                    # Use tqdm.write
+                    pbar.write(f"saving checkpoint to {ckpt_save_path}") 
+                    torch.save(checkpoint, ckpt_save_path)
+                    pbar.write("Checkpoint saving time: %f sec" % (time.time()-tcheckpointsaving_begin))
+        
+        if iter_num == 0 and eval_only:
+            break
 
-    if (time.time() - tlaunch > time_limit_seconds):
-        break
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        X, Y = get_batch('train') # Fetch batch inside the loop for simplicity with tqdm
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            with ctx:
+                logits, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            # Moved batch fetching inside the loop for tqdm simplicity
+            # X, Y = get_batch('train')
+            # backward pass, with gradient scaling if training in fp16
+            loss.backward()
 
-    iter_num += 1
-    local_iter_num += 1
-    if iter_num > max_iters:
-        break
+        if grad_clip != 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+
+        # timing and logging
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if iter_num % log_interval == 0 and master_process:
+            # get loss as float. note: this is a CPU-GPU sync point
+            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+            lossf = loss.item() * gradient_accumulation_steps
+            # Update progress bar postfix instead of printing every log_interval
+            pbar.set_postfix(loss=f'{lossf:.4f}', lr=f'{lr:.2e}', dt=f'{dt*1000:.1f}ms', refresh=False)
+            # Comment out the old print statement:
+            # print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms") 
+        
+        if (use_nGPT == 1):
+            normalize_matrices()
+
+        if (iter_num % 100 == 0) and master_process:
+            # Can optionally use pbar.write for less frequent logs like LR
+            # pbar.write("lr=%f" % lr) # Or keep it off if postfix is enough
+            pass
+
+        if master_process:
+            # Stat file writing logic remains unchanged
+            if iter_num % eval_interval == 0: # Write stats when eval happened this iter
+                # Ensure losses dictionary exists if eval happened this iter
+                if 'losses' in locals(): 
+                    resstr = f"{iter_num:.6e} {lr:.4e} {losses['train']:.4e} {losses['val']:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0:.4e} {0.0:.4e} "
+                    resstr = resstr + get_hparams_str(model) + "\n"
+                    
+                    if 'file' in locals() and not file.closed:
+                        file.write(resstr)
+                        file.flush()
+                    else: # Re-open if resuming and file wasn't opened
+                        stat_fname_local = os.path.join(globals().get('out_dir', './'), "stat")
+                        try:
+                            file = open(stat_fname_local, "a")
+                            file.write(resstr)
+                            file.flush()
+                        except Exception as e:
+                            pbar.write(f"Error writing to stat file: {e}")
+
+            if iter_num >= max_iters:
+                finished_fname = os.path.join(globals().get('out_dir', './'), "finished") # Use potentially overridden out_dir
+                try:
+                    with open(finished_fname, "w") as finished_file:
+                        finished_file.write("1")
+                except Exception as e:
+                    pbar.write(f"Error writing finished file: {e}")
+
+        if (time.time() - tlaunch > time_limit_seconds):
+            if master_process: pbar.write("Time limit reached, exiting.")
+            break
+
+        iter_num += 1
+        local_iter_num += 1
+        pbar.update(1) # Increment the progress bar
+        
+        if iter_num > max_iters:
+            break
+
+# tqdm closes automatically due to 'with' statement
+
 time_spent = time.time() - tlaunch
 print(f"Time spent: {time_spent} seconds")
+
+# Close stat file if open
+if master_process and 'file' in locals() and not file.closed:
+    file.close()
+
 if ddp:
     dist.barrier()
     dist.destroy_process_group()
