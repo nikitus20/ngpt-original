@@ -180,11 +180,29 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 tdataloading_begin = time.time()
-data_dir = '/content/drive/MyDrive/ngpt-data/openwebtext' 
-if not os.path.exists(data_dir):
-    print(f"ERROR: data_dir not found at {data_dir}")
+
+dataset = 'openwebtext' # Ensure dataset name is correct
+
+# Construct data directory path relative to the script location
+script_dir = os.path.dirname(__file__) # Get directory where train.py is located
+# Assume 'data' folder is at the same level as the script, or one level up if script is in a 'scripts' subdir.
+# Let's assume it's relative to the project root where train.py likely is.
+data_root = os.path.join(script_dir, 'data') # Path to the 'data' directory
+# If 'data' directory doesn't exist relative to script, maybe check one level up?
+# if not os.path.exists(data_root):
+#     data_root = os.path.join(script_dir, '..', 'data')
+data_dir = os.path.join(data_root, dataset) # Final path: ./data/openwebtext or ../data/openwebtext
+
+# Check if the path exists (sanity check)
+if not os.path.exists(os.path.join(data_dir, 'train.bin')): # Check for a specific file
+    print(f"ERROR: train.bin not found in {data_dir}")
+    print("Please ensure the 'data/openwebtext' directory exists relative to the project root and contains train.bin, val.bin, meta.pkl.")
+    # Optionally exit here if data is critical
+    # sys.exit(1) 
 else:
     print(f"Using data from: {data_dir}")
+
+# The rest of the code uses data_dir to find train.bin, val.bin, and meta.pkl
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
@@ -210,7 +228,7 @@ iter_num = 0
 
 
 # attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
+meta_path = os.path.join(data_dir, 'meta.pkl') # Ensure meta.pkl path uses the correct data_dir
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
