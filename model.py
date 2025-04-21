@@ -339,11 +339,13 @@ class GPT(nn.Module):
             # Ensure lm_head input matches its weight dtype (float32)
             logits = self.lm_head(x.float()) # Cast input to float32 before final layer
         elif self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod':
-            # Apply nGPT scaling before lm_head
+            # Cast final hidden state to float32 before lm_head
+            x_final = x.float() 
+            # Get logits first
+            logits = self.lm_head(x_final) 
+            # Now apply nGPT scaling *to the logits*
             sz = self.sz * (self.sz_init_value / self.sz_init_scaling) * (self.config.n_embd ** 0.5)
-            x = sz * x
-            # Ensure lm_head input matches its weight dtype (float32)
-            logits = self.lm_head(x.float()) # Cast input to float32 before final layer
+            logits = sz * logits # Apply scaling to logits (shape B, T, 50304)
         else: # Should not happen
              raise ValueError(f"Unknown norm_mode: {self.config.norm_mode}")
 
