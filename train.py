@@ -65,6 +65,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+out_dir = './' # Define default output directory here
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -156,10 +157,11 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 
-out_dir='./'
 if master_process:
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
+    # Ensure the potentially overridden out_dir exists
+    current_out_dir = globals().get('out_dir', './') # Get potentially overridden value
+    if not os.path.exists(current_out_dir):
+        os.makedirs(current_out_dir)
 
 
 local_seed = seed_offset
@@ -177,10 +179,11 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 tdataloading_begin = time.time()
-if os.path.exists('./../../data'):
-    data_dir = os.path.join('./../../data', dataset)
-else:   
-    data_dir = os.path.join('data', dataset)
+data_dir = '/content/drive/MyDrive/ngpt-data/openwebtext' 
+if not os.path.exists(data_dir):
+    print(f"ERROR: data_dir not found at {data_dir}")
+else:
+    print(f"Using data from: {data_dir}")
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
@@ -364,7 +367,7 @@ def get_hparams_str(model):
          
     return resstr
 
-stat_fname = out_dir + "/stat"
+stat_fname = os.path.join(globals().get('out_dir', './'), "stat") # Use potentially overridden out_dir
 if master_process:
     if init_from == 'scratch':
         file = open(stat_fname, "w")
@@ -372,7 +375,7 @@ if master_process:
         resstr = resstr + get_hparams_str(model) + "\n"
         file.write(resstr)
         arguments = sys.argv
-        fname_arg = out_dir + "/args"
+        fname_arg = os.path.join(globals().get('out_dir', './'), "args") # Use potentially overridden out_dir
         with open(fname_arg, 'w') as file_arg:
             for arg in arguments:
                 file_arg.write(arg + '\n')
@@ -465,7 +468,7 @@ while True:
                     'rng_state_numpy': np.random.get_state()
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(globals().get('out_dir', './'), 'ckpt.pt')) # Use potentially overridden out_dir
                 print("Checkpoint saving time: %f sec" % (time.time()-tcheckpointsaving_begin))
     
     if iter_num == 0 and eval_only:
@@ -520,7 +523,7 @@ while True:
         file.flush()
 
         if iter_num >= max_iters:
-            finished_fname = out_dir + "/finished"
+            finished_fname = os.path.join(globals().get('out_dir', './'), "finished") # Use potentially overridden out_dir
             finished_file = open(finished_fname, "w")
             finished_file.write("1")
             finished_file.close()
