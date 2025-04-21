@@ -76,6 +76,7 @@ batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch siz
 # model
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+norm_mode = 'baseline' # Add this line for default normalization mode ('baseline' or 'dotprod')
 # adamw optimizer
 max_iters = 600000 # total number of training iterations
 beta1 = 0.9
@@ -218,7 +219,7 @@ print("Data loading time: %f sec" % (time.time()-tdataloading_begin))
 # model init
 tmodelinit_begin = time.time()
 model_args = dict(use_nGPT=use_nGPT, n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, base_scale=base_scale, 
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, norm_mode=config['norm_mode'], dtype=config['dtype']) # Add dtype here
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -238,7 +239,16 @@ elif init_from == 'resume':
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['use_nGPT', 'base_scale', 'n_layer', 'n_head',  'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+    # Also need to potentially restore/check dtype from checkpoint?
+    # Let's assume for now it can be overridden by current config, like norm_mode.
+    if 'dtype' in checkpoint_model_args:
+         # If dtype was saved in checkpoint, potentially use it or check compatibility?
+         # For now, override with current config's dtype like we did for norm_mode.
+         pass # Keep the dtype from the current config
     # create the model
+    # Ensure the potentially overridden norm_mode and dtype are used even when resuming
+    model_args['norm_mode'] = config['norm_mode'] 
+    model_args['dtype'] = config['dtype'] # Ensure current dtype is used
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']

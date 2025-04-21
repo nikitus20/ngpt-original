@@ -69,114 +69,156 @@ class Block(nn.Module):
         super().__init__()
         self.config = config
 
+        # Common layers
         self.key = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
         self.query = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
         self.value = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
         self.att_c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        
-        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=torch.bfloat16)
-        self.silu    = nn.SiLU()
-        self.mlp_c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
 
-        if (config.use_nGPT == 0):
-            self.rmsnorm_att = RMSNorm(config.n_embd)
-            self.rmsnorm_mlp = RMSNorm(config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=torch.bfloat16)
+        self.silu = nn.SiLU()
+        self.mlp_c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=torch.bfloat16)
 
-        if (config.use_nGPT == 1):
+        # Mode-specific initializations
+        if config.norm_mode == 'baseline': # Corresponds to original use_nGPT=0
+             self.rmsnorm_att = RMSNorm(config.n_embd)
+             self.rmsnorm_mlp = RMSNorm(config.n_embd)
+        elif config.norm_mode == 'ngpt' or config.norm_mode == 'dotprod': # Both nGPT and dotprod need these parameters
+            # Parameters for nGPT's scaling/interpolation (also used by dotprod's residual update)
             self.attn_alpha_init_value = 0.05
             self.attn_alpha_init_scaling = config.base_scale
-            self.attn_alpha = torch.nn.Parameter(self.attn_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+            self.attn_alpha = torch.nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
             self.mlp_alpha_init_value = 0.05
             self.mlp_alpha_init_scaling = config.base_scale
-            self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+            self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
-            self.sqk_init_value = 1.0       
+            # Parameters for nGPT's QKV scaling
+            self.sqk_init_value = 1.0
             self.sqk_init_scaling = config.base_scale
-            self.sqk = torch.nn.Parameter(self.sqk_init_scaling*torch.ones(self.config.n_embd, dtype=torch.float32))
+            self.sqk = torch.nn.Parameter(self.sqk_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
+            # Parameters for nGPT's MLP scaling
             self.suv_init_value = 1.0
             self.suv_init_scaling = 1.0
-            self.suv = torch.nn.Parameter(self.suv_init_scaling*torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
+            self.suv = torch.nn.Parameter(self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
+        # No specific params needed only for dotprod init yet
 
-    
+
     def justnorm(self, x):
-        #return F.normalize(x, p=2, dim=-1)
-        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        # Ensure normalization happens in float32 for stability, then cast back
+        # Or keep in bfloat16? Let's try keeping it for now.
+        res = x / (x.norm(p=2, dim=-1, keepdim=True) + 1e-6) # Add epsilon for stability
         return res
+
+    # Helper for the nGPT / dotprod residual update logic
+    def _apply_ngpt_residual(self, x, delta, alpha_param, alpha_init_value, alpha_init_scaling):
+        lr = alpha_param * (alpha_init_value / alpha_init_scaling)
+        lr = torch.abs(lr)
+        A_norm = self.justnorm(x)
+        B_norm = self.justnorm(delta)
+        res = A_norm + lr * (B_norm - A_norm)
+        return self.justnorm(res)
 
     def forward(self, h):
         B, T, C = h.size()
+        x = h # Store original input for residual connections
 
-        hin = h
-        if (self.config.use_nGPT == 0):
-            hin = self.rmsnorm_att(h)
-        
+        # --- Attention Block ---
+        hin = x
+        if self.config.norm_mode == 'baseline':
+            hin = self.rmsnorm_att(x)
+
         q = self.query(hin)
         k = self.key(hin)
         v = self.value(hin)
 
-        q = q.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head) 
-        k = k.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
-        v = v.view(B, T, self.config.n_head, self.config.n_embd // self.config.n_head)
+        q = q.view(B, T, self.config.n_head, C // self.config.n_head)
+        k = k.view(B, T, self.config.n_head, C // self.config.n_head)
+        v = v.view(B, T, self.config.n_head, C // self.config.n_head)
 
-        sinusoidal_pos = get_sinusoidal_embeddings(T, self.config.n_embd // self.config.n_head).to(device=q.device)
-        q, k = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
-        q = q.transpose(2, 1)
-        k = k.transpose(2, 1)
+        # RoPE
+        sinusoidal_pos = get_sinusoidal_embeddings(T, C // self.config.n_head).to(device=q.device, dtype=q.dtype) # Match dtype
+        q_r, k_r = apply_rotary_position_embeddings(sinusoidal_pos, q.transpose(1, 2), k.transpose(1, 2))
+        q = q_r.transpose(1, 2)
+        k = k_r.transpose(1, 2)
 
-        if (self.config.use_nGPT == 1):
-            sqk = (self.sqk * (self.sqk_init_value/self.sqk_init_scaling)).view(1, 1, self.config.n_head, self.config.n_embd // self.config.n_head)
-            q = sqk * self.justnorm(q)  
-            k = sqk * self.justnorm(k)  
+        # Pre-attention scaling/norm for nGPT modes
+        if self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod':
+            sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, 1, self.config.n_head, C // self.config.n_head)
+            q = sqk * self.justnorm(q)
+            k = sqk * self.justnorm(k)
 
-        sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
-        if (self.config.use_nGPT == 0): softmax_scale = 1.0 / sqrt_head_dim 
-        if (self.config.use_nGPT == 1): softmax_scale = sqrt_head_dim 
-        y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
-        y = y.to(dtype=q.dtype)
-        y = y.contiguous().view(B, T, self.config.n_embd)
+        # Attention calculation (FlashAttention)
+        # Ensure inputs to flash_attn are bfloat16 as expected by layer definitions
+        q_attn = q.to(torch.bfloat16)
+        k_attn = k.to(torch.bfloat16)
+        v_attn = v.to(torch.bfloat16)
+        sqrt_head_dim = (C / self.config.n_head) ** 0.5
+        softmax_scale = sqrt_head_dim if (self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod') else (1.0 / sqrt_head_dim)
+        y = flash_attn_func(q_attn, k_attn, v_attn, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+        y = y.to(dtype=h.dtype) # Cast back to original dtype (potentially float32 if autocast disabled, or bfloat16)
+        y = y.contiguous().view(B, T, C)
 
-        h_att = self.att_c_proj(y)
+        # Attention projection
+        delta_att = self.att_c_proj(y)
 
-        if (self.config.use_nGPT == 0):
-            h = h + h_att
-        if (self.config.use_nGPT == 1):
-            lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
-            lr = torch.abs(lr)
-            
-            A_norm = self.justnorm(h) # normally, normalization is not needed
-            B_norm = self.justnorm(h_att)
-                
-            #res = (1.0 - lr) * A_norm + lr * B_norm
-            res = A_norm + lr * (B_norm - A_norm)
-            h = self.justnorm(res)
+        # --- Attention Residual Connection ---
+        if self.config.norm_mode == 'baseline':
+            x = x + delta_att
+        elif self.config.norm_mode == 'ngpt':
+            x = self._apply_ngpt_residual(x, delta_att, self.attn_alpha, self.attn_alpha_init_value, self.attn_alpha_init_scaling)
+        elif self.config.norm_mode == 'dotprod':
+            # Initialize r for the block, ensure correct dtype and device
+            # Create r tensor only once per block instance, initialized to ones.
+            # This assumes r is reset for each forward pass through the block.
+            r = torch.ones_like(x[..., :1], dtype=h.dtype) # Shape [B, T, 1]
 
-        hin = h
-        if (self.config.use_nGPT == 0):
-            hin = self.rmsnorm_mlp(h)
+            dot_att = torch.sum(x * delta_att, dim=-1, keepdim=True) # Use original x for dot product
+            # Need to handle potential dtype mismatches if autocast is used
+            r = r.to(dot_att.dtype) + dot_att # Accumulate r
+            # Ensure r doesn't become zero or negative if dot products are negative? Clamp?
+            r = torch.clamp(r, min=1e-6) # Clamp r for stability
+
+            delta_att_scaled = delta_att / r # Scale delta by 1/r
+            # Apply residual using the nGPT helper, but with the scaled delta
+            x = self._apply_ngpt_residual(x, delta_att_scaled, self.attn_alpha, self.attn_alpha_init_value, self.attn_alpha_init_scaling)
+            # Store r for MLP part. No need to register buffer if recomputed. We'll pass it.
+            r_after_attn = r 
+
+
+        # --- MLP Block ---
+        x_mlp_in = x # Input to MLP is the output of the Attn block
+        hin = x_mlp_in
+        if self.config.norm_mode == 'baseline':
+            hin = self.rmsnorm_mlp(x_mlp_in)
+
         uv = self.c_fc(hin)
-        if (self.config.use_nGPT == 1):
-            suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5))) 
-            uv = suv * uv  
-        u, v = torch.chunk(uv, 2, dim=-1)
-        x_mlp = u * self.silu(v)
-        h_mlp = self.mlp_c_proj(x_mlp)
+        # Pre-MLP scaling for nGPT modes
+        if self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod':
+            suv = (self.suv * (self.suv_init_value / self.suv_init_scaling) * (C ** 0.5))
+            uv = suv * uv
+        u, v_silu = torch.chunk(uv, 2, dim=-1)
+        x_mlp = u * self.silu(v_silu)
+        delta_mlp = self.mlp_c_proj(x_mlp)
 
-        if (self.config.use_nGPT == 0):
-            h = h + h_mlp
-        if (self.config.use_nGPT == 1):
-            lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
-            lr = torch.abs(lr)
+        # --- MLP Residual Connection ---
+        if self.config.norm_mode == 'baseline':
+            x = x + delta_mlp # Add to output of attention block
+        elif self.config.norm_mode == 'ngpt':
+            x = self._apply_ngpt_residual(x, delta_mlp, self.mlp_alpha, self.mlp_alpha_init_value, self.mlp_alpha_init_scaling)
+        elif self.config.norm_mode == 'dotprod':
+            # Spec: r_k <- r_k + <x_k, A_k>. Use x before residual update for dot product.
+            dot_mlp = torch.sum(x * delta_mlp, dim=-1, keepdim=True) 
+            # Use the r accumulated from the attention step
+            r_mlp = r_after_attn.to(dot_mlp.dtype) + dot_mlp # Accumulate further
+            r_mlp = torch.clamp(r_mlp, min=1e-6)
 
-            A_norm = self.justnorm(h) # normally, normalization is not needed
-            B_norm = self.justnorm(h_mlp)
-                
-            #res = (1.0 - lr) * A_norm + lr * B_norm
-            res = A_norm + lr * (B_norm - A_norm)
-            h = self.justnorm(res)
+            delta_mlp_scaled = delta_mlp / r_mlp # Scale delta by 1/r (cumulative)
+            # Apply residual using the nGPT helper, but with the scaled delta
+            x = self._apply_ngpt_residual(x, delta_mlp_scaled, self.mlp_alpha, self.mlp_alpha_init_value, self.mlp_alpha_init_scaling)
 
-        return h
+        return x # Return final output of the block
 
 @dataclass
 class GPTConfig:
@@ -186,9 +228,11 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 1024
     base_scale: float = 1.0 / (1024.0 ** 0.5)    # 1 / sqrt(n_embd)
-    use_nGPT: int = 0
+    use_nGPT: int = 0 # Deprecate this in favor of norm_mode? Keep for now.
+    norm_mode: str = 'baseline' # Add this field ('baseline', 'ngpt', 'dotprod')
     dropout: float = 0.0
-    bias: bool = False 
+    bias: bool = False
+    dtype: str = 'bfloat16' # Add dtype field
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, embdim: int, eps: float = 1e-6) -> None:
@@ -211,14 +255,19 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        self.config = config
+        self.config = config # Store config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # Ensure embedding weights are float32 as per spec
+            wte = nn.Embedding(config.vocab_size, config.n_embd, dtype=torch.float32),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config, il) for il in range(config.n_layer)])
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Ensure LM head weight matches embedding dtype if not tied, or handle tying carefully.
+        # Let's assume lm_head should also be float32 initially, but its input will be bfloat16/float16.
+        # Casting the input before the linear layer is usually handled by AMP or manual cast.
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False, dtype=torch.float32) # Use float32 for lm_head weights
+
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
@@ -232,17 +281,18 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=config.base_scale/math.sqrt(2 * config.n_layer))
-        # report number of parameters
+        
+        # Report number of parameters (moved slightly earlier)
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-    
-        if (config.use_nGPT == 1):
+
+        # Mode-specific final layer setup
+        if config.norm_mode == 'ngpt' or config.norm_mode == 'dotprod':
+            # nGPT specific scaling for output logits
             self.sz_init_value = 1.00
             self.sz_init_scaling = config.base_scale
             self.sz = torch.nn.Parameter(self.sz_init_scaling*torch.ones(config.vocab_size, dtype=torch.float32))
-
-        if (config.use_nGPT == 0):
+        elif config.norm_mode == 'baseline':
             self.rmsnorm_f = RMSNorm(config.n_embd)
-
 
     def get_num_params(self, non_embedding=True):
         """
@@ -267,30 +317,43 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # Forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # Embedding lookup (output is float32)
+
+        # Determine computation dtype from training script (e.g., bfloat16)
+        # Use torch.get_autocast_gpu_dtype() if available and in autocast context, else default?
+        # Or rely on explicit config 'dtype' from train.py? Let's use the config.
+        ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.config.dtype] # Assuming config has dtype
         
-        x = tok_emb
+        # Cast embedding output to compute_dtype for transformer blocks
+        x = self.transformer.drop(tok_emb.to(ptdtype))
+
         for block in self.transformer.h:
             x = block(x)
 
-        if (self.config.use_nGPT == 0):
-            x = self.rmsnorm_f(x)
+        # Final layer processing based on mode
+        if self.config.norm_mode == 'baseline':
+            x = self.rmsnorm_f(x) # Apply final RMSNorm
+            # Ensure lm_head input matches its weight dtype (float32)
+            logits = self.lm_head(x.float()) # Cast input to float32 before final layer
+        elif self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod':
+            # Apply nGPT scaling before lm_head
+            sz = self.sz * (self.sz_init_value / self.sz_init_scaling) * (self.config.n_embd ** 0.5)
+            x = sz * x
+            # Ensure lm_head input matches its weight dtype (float32)
+            logits = self.lm_head(x.float()) # Cast input to float32 before final layer
+        else: # Should not happen
+             raise ValueError(f"Unknown norm_mode: {self.config.norm_mode}")
 
+
+        loss = None
         if targets is not None:
-            logits = self.lm_head(x)
-            if (self.config.use_nGPT == 1):
-                sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
-                logits = sz * logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            if (self.config.use_nGPT == 1):
-                sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
-                logits = sz * logits
-            loss = None
+            # if we are given some desired targets also calculate the loss
+            logits_loss = logits.view(-1, logits.size(-1))
+            targets_loss = targets.view(-1)
+            loss = F.cross_entropy(logits_loss, targets_loss, ignore_index=-1)
 
         return logits, loss
 
