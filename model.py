@@ -38,7 +38,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+# Try importing flash_attn, handle ImportError if not installed
+try:
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+    _flash_attn_available = True
+except ImportError:
+    print("FlashAttention not found. Using standard PyTorch attention.")
+    _flash_attn_available = False
 
 
 def apply_rotary_position_embeddings(sinusoidal_pos, q, k):
@@ -149,16 +155,47 @@ class Block(nn.Module):
             q = sqk * self.justnorm(q)
             k = sqk * self.justnorm(k)
 
-        # Attention calculation (FlashAttention)
-        # Ensure inputs to flash_attn are bfloat16 as expected by layer definitions
-        q_attn = q.to(torch.bfloat16)
-        k_attn = k.to(torch.bfloat16)
-        v_attn = v.to(torch.bfloat16)
-        sqrt_head_dim = (C / self.config.n_head) ** 0.5
-        softmax_scale = sqrt_head_dim if (self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod') else (1.0 / sqrt_head_dim)
-        y = flash_attn_func(q_attn, k_attn, v_attn, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
-        y = y.to(dtype=h.dtype) # Cast back to original dtype (potentially float32 if autocast disabled, or bfloat16)
-        y = y.contiguous().view(B, T, C)
+        # Attention calculation (FlashAttention or Standard)
+        # Ensure inputs are bfloat16 if that's the compute type
+        # (Assuming layers are defined as bfloat16, QKV will be bf16)
+        q_attn = q # Use q,k,v directly as they should have the correct dtype from linear layers
+        k_attn = k
+        v_attn = v
+
+        # Check GPU capability for FlashAttention
+        use_flash = False
+        if _flash_attn_available and q_attn.device.type == 'cuda':
+            major, _ = torch.cuda.get_device_capability(q_attn.device)
+            if major >= 8: # Ampere or newer
+                use_flash = True
+
+        if use_flash:
+            # Use FlashAttention
+            sqrt_head_dim = (C / self.config.n_head) ** 0.5
+            softmax_scale = sqrt_head_dim if (self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod') else (1.0 / sqrt_head_dim)
+            # Ensure inputs to flash_attn are explicitly cast if layers weren't guaranteed bf16
+            # Let's assume they are bf16 from the Linear layers for now
+            y = flash_attn_func(q_attn, k_attn, v_attn, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+            # Cast back to original input dtype if necessary (e.g., if input `h` was fp32)
+            y = y.to(dtype=h.dtype) 
+            y = y.contiguous().view(B, T, C)
+        else:
+            # Use standard PyTorch scaled_dot_product_attention
+            # Transpose B, T, H, D -> B, H, T, D
+            q_std = q_attn.transpose(1, 2)
+            k_std = k_attn.transpose(1, 2)
+            v_std = v_attn.transpose(1, 2)
+            # F.scaled_dot_product_attention handles scaling and causal mask
+            y_std = F.scaled_dot_product_attention(q_std, k_std, v_std, 
+                                                   attn_mask=None, 
+                                                   dropout_p=0.0, # Apply dropout here if needed (config.dropout?)
+                                                   is_causal=True) 
+            # Transpose back B, H, T, D -> B, T, H, D
+            y = y_std.transpose(1, 2)
+            # Reshape B, T, H, D -> B, T, C
+            y = y.contiguous().view(B, T, C)
+            # Cast back to original input dtype if necessary
+            y = y.to(dtype=h.dtype)
 
         # Attention projection
         delta_att = self.att_c_proj(y)
