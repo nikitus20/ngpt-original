@@ -72,7 +72,7 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'tinystories'
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model
@@ -181,7 +181,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 tdataloading_begin = time.time()
 
-dataset = 'openwebtext' # Ensure dataset name is correct
+dataset = 'tinystories' # Ensure dataset name is correct
 
 # Construct data directory path relative to the script location
 script_dir = os.path.dirname(__file__) # Get directory where train.py is located
@@ -196,7 +196,7 @@ data_dir = os.path.join(data_root, dataset) # Final path: ./data/openwebtext or 
 # Check if the path exists (sanity check)
 if not os.path.exists(os.path.join(data_dir, 'train.bin')): # Check for a specific file
     print(f"ERROR: train.bin not found in {data_dir}")
-    print("Please ensure the 'data/openwebtext' directory exists relative to the project root and contains train.bin, val.bin, meta.pkl.")
+    print(f"Please ensure the 'data/{dataset}' directory exists relative to the project root and contains train.bin, val.bin, meta.pkl.")
     # Optionally exit here if data is critical
     # sys.exit(1) 
 else:
