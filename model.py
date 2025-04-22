@@ -175,7 +175,7 @@ class Block(nn.Module):
             softmax_scale = sqrt_head_dim if (self.config.norm_mode == 'ngpt' or self.config.norm_mode == 'dotprod') else (1.0 / sqrt_head_dim)
             # Ensure inputs to flash_attn are explicitly cast if layers weren't guaranteed bf16
             # Let's assume they are bf16 from the Linear layers for now
-            y = flash_attn_func(q_attn, k_attn, v_attn, dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
+            y = flash_attn_func(q.to(dtype=torch.bfloat16), k.to(dtype=torch.bfloat16), v.to(dtype=torch.bfloat16), dropout_p=0.0, softmax_scale=softmax_scale, causal=True, window_size=(-1, -1), alibi_slopes=None, deterministic=True)
             # Cast back to original input dtype if necessary (e.g., if input `h` was fp32)
             y = y.to(dtype=h.dtype) 
             y = y.contiguous().view(B, T, C)
