@@ -125,6 +125,27 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# Move data directory construction here, after config override
+# Construct data directory path relative to the script location
+script_dir = os.path.dirname(__file__) if '__file__' in locals() else os.getcwd() # Get directory where train.py is located or CWD if run interactively
+# Assume 'data' folder is at the same level as the script, or one level up if script is in a 'scripts' subdir.
+# Let's assume it's relative to the project root where train.py likely is.
+data_root = os.path.join(script_dir, 'data') # Path to the 'data' directory
+# If 'data' directory doesn't exist relative to script, maybe check one level up?
+# if not os.path.exists(data_root):
+#     data_root = os.path.join(script_dir, '..', 'data')
+data_dir = os.path.join(data_root, dataset) # Use the potentially overridden dataset variable
+
+# Check if the path exists (sanity check) - Now uses the configured dataset
+if master_process and not os.path.exists(os.path.join(data_dir, 'train.bin')): # Check for a specific file only on master
+    print(f"WARNING: train.bin not found in the configured data directory: {data_dir}")
+    print(f"Please ensure the 'data/{dataset}' directory exists relative to the project root and contains train.bin, val.bin, meta.pkl.")
+    # Optionally exit here if data is critical
+    # sys.exit(1)
+elif master_process:
+    print(f"Using data from: {data_dir}")
+
+
 if (use_nGPT == 0):
     base_scale = 0.02 # can be interpreted as init_std
 if (use_nGPT == 1):
@@ -181,30 +202,24 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 tdataloading_begin = time.time()
 
-dataset = 'tinystories' # Ensure dataset name is correct
-
-# Construct data directory path relative to the script location
-script_dir = os.path.dirname(__file__) # Get directory where train.py is located
-# Assume 'data' folder is at the same level as the script, or one level up if script is in a 'scripts' subdir.
-# Let's assume it's relative to the project root where train.py likely is.
-data_root = os.path.join(script_dir, 'data') # Path to the 'data' directory
-# If 'data' directory doesn't exist relative to script, maybe check one level up?
-# if not os.path.exists(data_root):
-#     data_root = os.path.join(script_dir, '..', 'data')
-data_dir = os.path.join(data_root, dataset) # Final path: ./data/openwebtext or ../data/openwebtext
+# Remove the hardcoded dataset assignment here as it's now configured above
+# dataset = 'tinystories' # Ensure dataset name is correct
 
 # Check if the path exists (sanity check)
-if not os.path.exists(os.path.join(data_dir, 'train.bin')): # Check for a specific file
-    print(f"ERROR: train.bin not found in {data_dir}")
-    print(f"Please ensure the 'data/{dataset}' directory exists relative to the project root and contains train.bin, val.bin, meta.pkl.")
-    # Optionally exit here if data is critical
-    # sys.exit(1) 
-else:
-    print(f"Using data from: {data_dir}")
+# Moved above, after config override
 
 # The rest of the code uses data_dir to find train.bin, val.bin, and meta.pkl
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# Ensure memmap uses the potentially updated data_dir
+train_data_path = os.path.join(data_dir, 'train.bin')
+val_data_path = os.path.join(data_dir, 'val.bin')
+# Add checks for file existence before creating memmap
+if not os.path.exists(train_data_path):
+     raise FileNotFoundError(f"Training data file not found: {train_data_path}")
+if not os.path.exists(val_data_path):
+     raise FileNotFoundError(f"Validation data file not found: {val_data_path}")
+
+train_data = np.memmap(train_data_path, dtype=np.uint16, mode='r')
+val_data = np.memmap(val_data_path, dtype=np.uint16, mode='r')
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
